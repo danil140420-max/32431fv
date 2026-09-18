@@ -43,8 +43,8 @@ from aiogram.types import (
 #                              НАСТРОЙКИ                              #
 # ------------------------------------------------------------------ #
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ваш telegram id для приёма заявок
+BOT_TOKEN = os.getenv("8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44", "8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44")
+ADMIN_ID = int(os.getenv("8639114682", "8639114682"))  # ваш telegram id для приёма заявок
 
 PRICE_PER_STAR = 1.5  # руб. за 1 звезду
 MIN_USERNAME_STARS = 50  # минимум звёзд при покупке "по юзернейму"
