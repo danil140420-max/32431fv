@@ -7,25 +7,34 @@
     pip install aiogram==3.13.1 python-dotenv
 
 Запуск:
-    export BOT_TOKEN="ваш_токен_от_BotFather"
+    export BOT_TOKEN="8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44"
+    export ADMIN_ID="8639114682"       # куда приходят чеки на проверку
+    export CARD_NUMBER="2200701233887170"
+    export CARD_HOLDER="-"
+    export CARD_BANK="Т-Банк"
     python stars_bot.py
 
-ВАЖНО (прочитайте перед использованием):
-Этот файл даёт готовый интерфейс (меню, кнопки, расчёт цены, приём заявки).
-Реального списания денег и реальной отправки звёзд/подарков здесь НЕТ —
-для этого нужно подключить платёжный провайдер (Telegram Payments /
-ЮKassa / CryptoBot и т.п.) и источник звёзд (например, Fragment API
-или ваш поставщик). Место для интеграции отмечено комментарием
-"# TODO: PAYMENT INTEGRATION" и "# TODO: STARS DELIVERY".
-Без этого бот только формирует заказ и передаёт его администратору
-для ручной обработки — это самый простой и часто используемый вариант
-для таких ботов.
+КАК РАБОТАЕТ ОПЛАТА:
+1. Покупатель выбирает заказ → бот показывает реквизиты карты и номер заказа.
+2. Покупатель переводит деньги и присылает в бот скриншот/фото чека.
+3. Чек с деталями заказа уходит администратору (ADMIN_ID) с кнопками
+   "Подтвердить" / "Отклонить".
+4. После подтверждения покупатель получает уведомление, и именно в этот
+   момент нужно реально отправить звёзды/подарок — место отмечено
+   комментарием "# TODO: STARS DELIVERY" (например, через Fragment API
+   или вашего поставщика звёзд).
+
+Заказы хранятся в памяти процесса (словарь ORDERS) — при перезапуске
+бота они теряются. Для продакшена стоит перенести это в базу данных
+(sqlite/postgres), особенно на Railway, где процесс может перезапускаться.
 """
 
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, StateFilter
@@ -43,17 +52,43 @@ from aiogram.types import (
 #                              НАСТРОЙКИ                              #
 # ------------------------------------------------------------------ #
 
-BOT_TOKEN = os.getenv("8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44", "8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44")
-ADMIN_ID = int(os.getenv("8639114682", "8639114682"))  # ваш telegram id для приёма заявок
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ваш telegram id для приёма заявок
 
 PRICE_PER_STAR = 1.5  # руб. за 1 звезду
 MIN_USERNAME_STARS = 50  # минимум звёзд при покупке "по юзернейму"
+
+# реквизиты для перевода — впишите свои
+CARD_NUMBER = os.getenv("CARD_NUMBER", "0000 0000 0000 0000")
+CARD_HOLDER = os.getenv("CARD_HOLDER", "IVAN IVANOV")
+CARD_BANK = os.getenv("CARD_BANK", "Т-Банк")
 
 # фиолетовая палитра — используем кружки/квадраты как акцент в кнопках
 DOT = "🟣"
 ACCENT = "💜"
 
 logging.basicConfig(level=logging.INFO)
+
+# ------------------------------------------------------------------ #
+#                      ХРАНИЛИЩЕ ЗАКАЗОВ (в памяти)                  #
+# ------------------------------------------------------------------ #
+# Для продакшена лучше вынести в БД (sqlite/postgres) — при перезапуске
+# процесса этот словарь очищается.
+
+
+@dataclass
+class Order:
+    order_id: str
+    buyer_id: int
+    buyer_chat_id: int
+    buyer_username: Optional[str]
+    description: str  # что покупают (подарок / юзернейм + кол-во звёзд)
+    stars: int
+    total_rub: float
+    status: str = "awaiting_receipt"  # awaiting_receipt -> pending_review -> confirmed/rejected
+
+
+ORDERS: dict[str, Order] = {}
 
 # ------------------------------------------------------------------ #
 #                         ПОДАРОЧНЫЕ ПАКЕТЫ                          #
@@ -130,7 +165,7 @@ def gift_menu_kb() -> InlineKeyboardMarkup:
 def confirm_kb(payload: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"{ACCENT} ✅ Оплатить", callback_data=f"pay_{payload}")],
+            [InlineKeyboardButton(text=f"{ACCENT} 💳 Перейти к оплате", callback_data=f"pay_{payload}")],
             [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_main")],
         ]
     )
@@ -142,6 +177,23 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
+def receipt_wait_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отменить заказ", callback_data="back_main")]]
+    )
+
+
+def admin_review_kb(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_ok_{order_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{order_id}"),
+            ]
+        ]
+    )
+
+
 # ------------------------------------------------------------------ #
 #                                FSM                                  #
 # ------------------------------------------------------------------ #
@@ -150,6 +202,10 @@ def cancel_kb() -> InlineKeyboardMarkup:
 class BuyByUsername(StatesGroup):
     waiting_username = State()
     waiting_amount = State()
+
+
+class ReceiptWait(StatesGroup):
+    waiting_receipt = State()
 
 
 # ------------------------------------------------------------------ #
@@ -307,34 +363,169 @@ async def msg_get_amount(message: Message, state: FSMContext) -> None:
 # ------------------------------ Оплата ------------------------------ #
 
 
+def _parse_payload(payload: str) -> tuple[str, int]:
+    """Возвращает (описание заказа, количество звёзд) по payload из confirm_kb."""
+    if payload.startswith("gift_"):
+        key = payload[len("gift_") :]
+        gift = GIFTS_BY_KEY[key]
+        return f"Подарок: {gift.title}", gift.stars
+
+    if payload.startswith("user_"):
+        rest = payload[len("user_") :]
+        username, amount_str = rest.rsplit("_", 1)
+        return f"По юзернейму: @{username}", int(amount_str)
+
+    raise ValueError(f"Неизвестный payload: {payload}")
+
+
 @router.callback_query(F.data.startswith("pay_"))
-async def cb_pay(call: CallbackQuery) -> None:
+async def cb_pay(call: CallbackQuery, state: FSMContext) -> None:
     payload = call.data.removeprefix("pay_")
+    description, stars = _parse_payload(payload)
+    total = price_for(stars)
 
-    # TODO: PAYMENT INTEGRATION
-    # Здесь нужно выставить реальный счёт — например через
-    # bot.send_invoice(...) для Telegram Payments, либо создать
-    # платёж в ЮKassa/CryptoBot и подождать вебхук/колбэк об оплате.
-    # После подтверждения оплаты — вызвать доставку звёзд ниже.
+    order_id = uuid.uuid4().hex[:8]
+    order = Order(
+        order_id=order_id,
+        buyer_id=call.from_user.id,
+        buyer_chat_id=call.message.chat.id,
+        buyer_username=call.from_user.username,
+        description=description,
+        stars=stars,
+        total_rub=total,
+    )
+    ORDERS[order_id] = order
 
-    await call.message.edit_text(
-        f"{ACCENT} Заказ принят и передан на обработку.\n\n"
-        "Как только оплата подтвердится, звёзды/подарок будут отправлены "
-        "автоматически. Если возникнут вопросы — напишите в поддержку.",
+    await state.set_state(ReceiptWait.waiting_receipt)
+    await state.update_data(order_id=order_id)
+
+    text = (
+        f"{ACCENT} <b>Реквизиты для перевода</b>\n\n"
+        f"Заказ: {description}\n"
+        f"Сумма: <b>{total} ₽</b>\n\n"
+        f"💳 Карта: <code>{CARD_NUMBER}</code>\n"
+        f"👤 Получатель: {CARD_HOLDER}\n"
+        f"🏦 Банк: {CARD_BANK}\n\n"
+        f"Номер заказа: <code>{order_id}</code>\n\n"
+        "После перевода отправьте сюда <b>скриншот или фото чека</b> — "
+        "заявка уйдёт на проверку."
+    )
+    await call.message.edit_text(text, reply_markup=receipt_wait_kb())
+    await call.answer()
+
+
+@router.message(StateFilter(ReceiptWait.waiting_receipt), F.photo | F.document)
+async def msg_receipt_received(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_id = data.get("order_id")
+    order = ORDERS.get(order_id)
+
+    if not order:
+        await message.answer("Заказ не найден, начните заново из главного меню /start")
+        await state.clear()
+        return
+
+    order.status = "pending_review"
+
+    caption = (
+        f"{ACCENT} <b>Новый чек на проверку</b>\n\n"
+        f"Заказ: <code>{order.order_id}</code>\n"
+        f"От: @{order.buyer_username or order.buyer_id}\n"
+        f"Детали: {order.description}\n"
+        f"Звёзд: {order.stars} ⭐\n"
+        f"Сумма: {order.total_rub} ₽"
     )
 
     if ADMIN_ID:
-        # TODO: STARS DELIVERY
-        # После реального подтверждения оплаты здесь вызывается функция,
-        # которая покупает и отправляет звёзды/подарок получателю
-        # (например, через Fragment API или вашего поставщика звёзд).
-        await call.bot.send_message(
-            ADMIN_ID,
-            f"Новый заказ от @{call.from_user.username or call.from_user.id}\n"
-            f"payload: {payload}",
-        )
+        if message.photo:
+            await message.bot.send_photo(
+                ADMIN_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                reply_markup=admin_review_kb(order.order_id),
+            )
+        else:
+            await message.bot.send_document(
+                ADMIN_ID,
+                document=message.document.file_id,
+                caption=caption,
+                reply_markup=admin_review_kb(order.order_id),
+            )
 
-    await call.answer("Заказ отправлен на обработку ✅")
+    await message.answer(
+        f"{ACCENT} Чек получен ✅\n\n"
+        "Заявка отправлена на проверку. Как только оплата подтвердится, "
+        "звёзды/подарок будут отправлены.",
+    )
+    await state.clear()
+
+
+@router.message(StateFilter(ReceiptWait.waiting_receipt))
+async def msg_receipt_wrong_type(message: Message) -> None:
+    await message.answer(
+        "Пришлите, пожалуйста, скриншот или фото чека об оплате.",
+        reply_markup=receipt_wait_kb(),
+    )
+
+
+# --------------------------- Проверка админом ------------------------- #
+
+
+@router.callback_query(F.data.startswith("adm_ok_"))
+async def cb_admin_confirm(call: CallbackQuery) -> None:
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Недостаточно прав", show_alert=True)
+        return
+
+    order_id = call.data.removeprefix("adm_ok_")
+    order = ORDERS.get(order_id)
+    if not order:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+
+    order.status = "confirmed"
+
+    # TODO: STARS DELIVERY
+    # Здесь вызывается функция, которая реально покупает и отправляет
+    # звёзды/подарок получателю (например, через Fragment API или
+    # вашего поставщика звёзд), используя order.description / order.stars.
+
+    await call.bot.send_message(
+        order.buyer_chat_id,
+        f"{ACCENT} Оплата по заказу <code>{order.order_id}</code> подтверждена ✅\n"
+        "Звёзды/подарок будут зачислены в ближайшее время.",
+    )
+    await call.message.edit_caption(
+        caption=call.message.caption + "\n\n✅ ПОДТВЕРЖДЕНО",
+        reply_markup=None,
+    )
+    await call.answer("Подтверждено")
+
+
+@router.callback_query(F.data.startswith("adm_no_"))
+async def cb_admin_reject(call: CallbackQuery) -> None:
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Недостаточно прав", show_alert=True)
+        return
+
+    order_id = call.data.removeprefix("adm_no_")
+    order = ORDERS.get(order_id)
+    if not order:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+
+    order.status = "rejected"
+
+    await call.bot.send_message(
+        order.buyer_chat_id,
+        f"{ACCENT} По заказу <code>{order.order_id}</code> оплата не подтверждена ❌\n"
+        "Свяжитесь с поддержкой или отправьте корректный чек ещё раз через /start.",
+    )
+    await call.message.edit_caption(
+        caption=call.message.caption + "\n\n❌ ОТКЛОНЕНО",
+        reply_markup=None,
+    )
+    await call.answer("Отклонено")
 
 
 # ------------------------------------------------------------------ #
