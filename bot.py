@@ -7,10 +7,10 @@
     pip install aiogram==3.13.1 python-dotenv
 
 Запуск:
-    export BOT_TOKEN="8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44"
-    export ADMIN_ID="8639114682"       # куда приходят чеки на проверку
-    export CARD_NUMBER="2200701233887170"
-    export CARD_HOLDER="-"
+    export BOT_TOKEN="ваш_токен_от_BotFather"
+    export ADMIN_ID="ваш_telegram_id"       # куда приходят чеки на проверку
+    export CARD_NUMBER="0000 0000 0000 0000"
+    export CARD_HOLDER="IVAN IVANOV"
     export CARD_BANK="Т-Банк"
     python stars_bot.py
 
@@ -34,10 +34,11 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -63,6 +64,8 @@ CARD_NUMBER = os.getenv("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_HOLDER = os.getenv("CARD_HOLDER", "IVAN IVANOV")
 CARD_BANK = os.getenv("CARD_BANK", "Т-Банк")
 
+ORDER_TIMEOUT_MINUTES = int(os.getenv("ORDER_TIMEOUT_MINUTES", "30"))
+
 # фиолетовая палитра — используем кружки/квадраты как акцент в кнопках
 DOT = "🟣"
 ACCENT = "💜"
@@ -85,10 +88,21 @@ class Order:
     description: str  # что покупают (подарок / юзернейм + кол-во звёзд)
     stars: int
     total_rub: float
-    status: str = "awaiting_receipt"  # awaiting_receipt -> pending_review -> confirmed/rejected
+    status: str = "awaiting_receipt"  # awaiting_receipt -> pending_review -> confirmed/rejected/expired/cancelled
+    created_at: datetime = field(default_factory=datetime.now)
 
 
 ORDERS: dict[str, Order] = {}
+ORDER_TIMEOUT_TASKS: dict[str, asyncio.Task] = {}
+
+STATUS_LABELS = {
+    "awaiting_receipt": "⏳ Ожидает оплаты",
+    "pending_review": "🔍 Проверяется",
+    "confirmed": "✅ Выполнен",
+    "rejected": "❌ Отклонён",
+    "expired": "⌛ Истёк срок",
+    "cancelled": "🚫 Отменён",
+}
 
 # ------------------------------------------------------------------ #
 #                         ПОДАРОЧНЫЕ ПАКЕТЫ                          #
@@ -128,7 +142,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"{DOT} Купить звёзды ⭐", callback_data="buy_stars")],
+            [InlineKeyboardButton(text=f"{DOT} 📦 Мои заказы", callback_data="my_orders")],
             [InlineKeyboardButton(text=f"{DOT} Цена и условия", callback_data="info")],
+            [InlineKeyboardButton(text=f"{DOT} ❓ FAQ", callback_data="faq")],
         ]
     )
 
@@ -226,6 +242,23 @@ INFO_TEXT = (
     "— После оплаты звёзды/подарок зачисляются в течение нескольких минут"
 )
 
+FAQ_TEXT = (
+    f"{ACCENT} <b>Частые вопросы</b>\n\n"
+    "<b>Сколько ждать зачисления после оплаты?</b>\n"
+    "Обычно до 15–30 минут после подтверждения чека администратором.\n\n"
+    "<b>Что делать, если чек не приняли?</b>\n"
+    "Проверьте, что скриншот читаемый и сумма совпадает с заказом, "
+    "и отправьте чек заново через /start.\n\n"
+    f"<b>Что если не успел оплатить вовремя?</b>\n"
+    f"Заказ автоматически отменяется через {ORDER_TIMEOUT_MINUTES} мин. ожидания "
+    "— просто оформите новый через /start.\n\n"
+    "<b>Куда смотреть статус заказа?</b>\n"
+    "В разделе «📦 Мои заказы» в главном меню.\n\n"
+    "<b>Можно ли вернуть деньги?</b>\n"
+    "Если оплата не была подтверждена и звёзды не зачислены — напишите "
+    "администратору, средства вернём."
+)
+
 router = Router()
 
 
@@ -242,6 +275,16 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_id = data.get("order_id")
+    if order_id:
+        order = ORDERS.get(order_id)
+        if order and order.status == "awaiting_receipt":
+            order.status = "cancelled"
+        task = ORDER_TIMEOUT_TASKS.pop(order_id, None)
+        if task:
+            task.cancel()
+
     await state.clear()
     await call.message.edit_text(WELCOME_TEXT, reply_markup=main_menu_kb())
     await call.answer()
@@ -250,6 +293,37 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "info")
 async def cb_info(call: CallbackQuery) -> None:
     await call.message.edit_text(INFO_TEXT, reply_markup=main_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "faq")
+async def cb_faq(call: CallbackQuery) -> None:
+    await call.message.edit_text(FAQ_TEXT, reply_markup=main_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "my_orders")
+async def cb_my_orders(call: CallbackQuery) -> None:
+    user_orders = sorted(
+        (o for o in ORDERS.values() if o.buyer_id == call.from_user.id),
+        key=lambda o: o.created_at,
+        reverse=True,
+    )[:15]
+
+    if not user_orders:
+        text = f"{ACCENT} У вас пока нет заказов.\n\nОформите первый через «Купить звёзды»."
+    else:
+        lines = [f"{ACCENT} <b>Ваши последние заказы</b>\n"]
+        for o in user_orders:
+            label = STATUS_LABELS.get(o.status, o.status)
+            lines.append(
+                f"<code>{o.order_id}</code> — {o.description}\n"
+                f"{o.stars}⭐ · {o.total_rub}₽ · {label}\n"
+                f"{o.created_at.strftime('%d.%m %H:%M')}\n"
+            )
+        text = "\n".join(lines)
+
+    await call.message.edit_text(text, reply_markup=main_menu_kb())
     await call.answer()
 
 
@@ -363,6 +437,28 @@ async def msg_get_amount(message: Message, state: FSMContext) -> None:
 # ------------------------------ Оплата ------------------------------ #
 
 
+async def expire_order(order_id: str, bot: Bot) -> None:
+    """Автоматически отменяет заказ, если чек не пришёл вовремя."""
+    await asyncio.sleep(ORDER_TIMEOUT_MINUTES * 60)
+
+    order = ORDERS.get(order_id)
+    if not order or order.status != "awaiting_receipt":
+        return  # уже оплачен/отменён/чек отправлен
+
+    order.status = "expired"
+    ORDER_TIMEOUT_TASKS.pop(order_id, None)
+
+    try:
+        await bot.send_message(
+            order.buyer_chat_id,
+            f"{ACCENT} Заказ <code>{order.order_id}</code> отменён — "
+            f"истекло время ожидания оплаты ({ORDER_TIMEOUT_MINUTES} мин).\n\n"
+            "Оформите новый заказ через /start.",
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить покупателя об истёкшем заказе %s", order_id)
+
+
 def _parse_payload(payload: str) -> tuple[str, int]:
     """Возвращает (описание заказа, количество звёзд) по payload из confirm_kb."""
     if payload.startswith("gift_"):
@@ -395,6 +491,7 @@ async def cb_pay(call: CallbackQuery, state: FSMContext) -> None:
         total_rub=total,
     )
     ORDERS[order_id] = order
+    ORDER_TIMEOUT_TASKS[order_id] = asyncio.create_task(expire_order(order_id, call.bot))
 
     await state.set_state(ReceiptWait.waiting_receipt)
     await state.update_data(order_id=order_id)
@@ -407,6 +504,8 @@ async def cb_pay(call: CallbackQuery, state: FSMContext) -> None:
         f"👤 Получатель: {CARD_HOLDER}\n"
         f"🏦 Банк: {CARD_BANK}\n\n"
         f"Номер заказа: <code>{order_id}</code>\n\n"
+        f"⏱ Заказ отменится автоматически, если не оплатить в течение "
+        f"{ORDER_TIMEOUT_MINUTES} мин.\n\n"
         "После перевода отправьте сюда <b>скриншот или фото чека</b> — "
         "заявка уйдёт на проверку."
     )
@@ -424,6 +523,18 @@ async def msg_receipt_received(message: Message, state: FSMContext) -> None:
         await message.answer("Заказ не найден, начните заново из главного меню /start")
         await state.clear()
         return
+
+    if order.status == "expired":
+        await message.answer(
+            f"{ACCENT} Этот заказ уже отменён по истечении времени ожидания.\n"
+            "Оформите новый через /start.",
+        )
+        await state.clear()
+        return
+
+    task = ORDER_TIMEOUT_TASKS.pop(order_id, None)
+    if task:
+        task.cancel()
 
     order.status = "pending_review"
 
@@ -526,6 +637,65 @@ async def cb_admin_reject(call: CallbackQuery) -> None:
         reply_markup=None,
     )
     await call.answer("Отклонено")
+
+
+# ------------------------- Админ: /orders ------------------------- #
+
+ORDERS_FILTERS = {
+    "pending": ("pending_review",),
+    "awaiting": ("awaiting_receipt",),
+    "confirmed": ("confirmed",),
+    "rejected": ("rejected",),
+    "expired": ("expired",),
+    "cancelled": ("cancelled",),
+    "all": None,
+}
+
+
+@router.message(Command("orders"))
+async def cmd_orders(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return  # обычным пользователям команда не отвечает
+
+    args = message.text.split(maxsplit=1)
+    filter_key = args[1].strip().lower() if len(args) > 1 else "pending"
+
+    if filter_key not in ORDERS_FILTERS:
+        await message.answer(
+            "Неизвестный фильтр. Доступные: "
+            + ", ".join(f"<code>{k}</code>" for k in ORDERS_FILTERS)
+        )
+        return
+
+    statuses = ORDERS_FILTERS[filter_key]
+    orders = sorted(
+        (o for o in ORDERS.values() if statuses is None or o.status in statuses),
+        key=lambda o: o.created_at,
+        reverse=True,
+    )[:30]
+
+    if not orders:
+        await message.answer(f"{ACCENT} Заказов по фильтру «{filter_key}» нет.")
+        return
+
+    lines = [f"{ACCENT} <b>Заказы</b> — фильтр: {filter_key} (последние {len(orders)})\n"]
+    for o in orders:
+        label = STATUS_LABELS.get(o.status, o.status)
+        lines.append(
+            f"<code>{o.order_id}</code> · @{o.buyer_username or o.buyer_id}\n"
+            f"{o.description} · {o.stars}⭐ · {o.total_rub}₽ · {label}\n"
+            f"{o.created_at.strftime('%d.%m %H:%M')}\n"
+        )
+
+    # Telegram режет длинные сообщения — разбиваем блоками
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > 3500:
+            await message.answer(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await message.answer(chunk)
 
 
 # ------------------------------------------------------------------ #
