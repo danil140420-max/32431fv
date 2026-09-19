@@ -7,11 +7,11 @@
     pip install aiogram==3.13.1 python-dotenv
 
 Запуск:
-    export BOT_TOKEN="ваш_токен_от_BotFather"
-    export ADMIN_ID="ваш_telegram_id"       # куда приходят чеки на проверку
-    export CARD_NUMBER="0000 0000 0000 0000"
-    export CARD_HOLDER="IVAN IVANOV"
-    export CARD_BANK="Т-Банк"
+    export BOT_TOKEN="8632892271:AAGbIzSLqR1jIhXMRDCriFxxzEDu1c8kB44"
+    export ADMIN_ID="7570922005" 
+    export CARD_NUMBER="5599002141809097"
+    export CARD_HOLDER="ЮMoney"
+    export CARD_BANK="ЮMoney"
     python stars_bot.py
 
 КАК РАБОТАЕТ ОПЛАТА:
